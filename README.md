@@ -1,4 +1,4 @@
-# OG — OpenClaw Python PoC
+# OG — OpenClaw Python Experiment - Learning Report
 
 A working Python CLI agent that replicates the core architectural patterns from [OpenClaw](https://openclaw.ai/) (the open-source AI assistant with 60k+ GitHub stars). The goal was to understand those patterns by implementing them in miniature — not just reading about them, but running them against real files on a local machine.
 
