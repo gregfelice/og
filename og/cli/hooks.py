@@ -147,7 +147,7 @@ async def inject_impl(
     if memory_path.exists():
         content = memory_path.read_text(encoding="utf-8").strip()
         if content:
-            return f"# Recalled Context\n\n{content}"
+            return f"# \U0001f7e2 OG Active — Recalled Context\n\n{content}"
 
     return ""
 
@@ -177,4 +177,4 @@ def _format_inject_rows(rows) -> str:
     if not sections:
         return ""
 
-    return "# Recalled Context\n\n" + "\n\n".join(sections)
+    return "# \U0001f7e2 OG Active — Recalled Context\n\n" + "\n\n".join(sections)

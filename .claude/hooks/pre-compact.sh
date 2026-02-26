@@ -6,5 +6,8 @@ SESSION_ID=$(echo "$INPUT" | python3 -c "import sys,json; print(json.load(sys.st
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OG_BIN="${SCRIPT_DIR}/.venv/bin/og"
 [ -x "$OG_BIN" ] || OG_BIN="og"
-[ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ] && "$OG_BIN" extract --file "$TRANSCRIPT" --session-id "$SESSION_ID" >/dev/null 2>&1 || true
+if [ -n "$TRANSCRIPT" ] && [ -f "$TRANSCRIPT" ]; then
+    notify-send -i dialog-information -t 3000 "🟢 OG" "Extracting knowledge (pre-compact)" 2>/dev/null &
+    "$OG_BIN" extract --file "$TRANSCRIPT" --session-id "$SESSION_ID" >/dev/null 2>&1 || true
+fi
 exit 0
