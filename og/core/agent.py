@@ -29,15 +29,21 @@ class Agent:
         self,
         config: Config,
         memory: Memory | PgMemory,
+        session_store: SessionStore | None = None,
+        budget: BudgetTracker | None = None,
         pool=None,
     ):
         self.config = config
         self.client = anthropic.AsyncAnthropic()
         self.tools = ToolRegistry(bash_timeout=config.tools.bash_timeout)
-        self.session_store = SessionStore(config.session.storage_dir)
         self.memory = memory
         self.pool = pool
-        self.budget = BudgetTracker(
+        self.compact_hook = None
+        self._user_message_count = 0
+
+        # Use provided backends or create flat-file defaults
+        self.session_store = session_store or SessionStore(config.session.storage_dir)
+        self.budget = budget or BudgetTracker(
             budget_limit=config.llm.budget_limit,
             ledger_path=Path.home() / ".og" / "budget.jsonl",
         )
@@ -56,13 +62,18 @@ class Agent:
 
     @classmethod
     async def create(cls, config: Config) -> Agent:
-        """Async factory: tries PostgreSQL + pgvector, falls back to flat-file Memory."""
+        """Async factory: tries PostgreSQL backends, falls back to flat-file."""
         pool = None
         memory: Memory | PgMemory
+        session_store = None
+        budget = None
 
         try:
             import asyncpg
             from pgvector.asyncpg import register_vector
+
+            from og.core.pg_budget import PgBudgetTracker
+            from og.session.pg import PgSessionStore
 
             pool = await asyncpg.create_pool(
                 dsn=config.db.dsn,
@@ -76,14 +87,58 @@ class Agent:
             )
             # Quick connectivity check: embed a test string
             await embedder.embed("connection test")
+
+            project_id = config.memory.project_id
+
             memory = PgMemory(
                 pool=pool,
                 embedder=embedder,
-                project_id=config.memory.project_id,
+                project_id=project_id,
             )
-            logger.info("Using PostgreSQL + pgvector memory store")
+            session_store = PgSessionStore(pool=pool, project_id=project_id)
+            budget = PgBudgetTracker(
+                pool=pool,
+                project_id=project_id,
+                budget_limit=config.llm.budget_limit,
+            )
+            logger.info("Using PostgreSQL backends (memory, sessions, budget)")
+
+            # Phase 3: try to set up knowledge graph
+            try:
+                from og.knowledge.extractor import KnowledgeExtractor
+                from og.knowledge.graph import KnowledgeGraph
+                from og.knowledge.hooks import PreCompactHook
+
+                graph = KnowledgeGraph(pool=pool, project_id=project_id)
+                extractor = KnowledgeExtractor()
+                compact_hook = PreCompactHook(
+                    pool=pool,
+                    embedder=embedder,
+                    extractor=extractor,
+                    graph=graph,
+                    project_id=project_id,
+                )
+                memory = PgMemory(
+                    pool=pool,
+                    embedder=embedder,
+                    project_id=project_id,
+                    graph=graph,
+                )
+                agent = cls(
+                    config=config,
+                    memory=memory,
+                    session_store=session_store,
+                    budget=budget,
+                    pool=pool,
+                )
+                agent.compact_hook = compact_hook
+                logger.info("Knowledge graph enabled")
+                return agent
+            except Exception as e:
+                logger.debug("Knowledge graph not available: %s", e)
+                # Fall through to return agent without graph
         except Exception as e:
-            logger.warning("DB unavailable, using flat-file memory: %s", e)
+            logger.warning("DB unavailable, using flat-file backends: %s", e)
             if pool is not None:
                 await pool.close()
                 pool = None
@@ -93,26 +148,33 @@ class Agent:
                 daily_dir=config.memory.daily_logs_dir,
             )
 
-        return cls(config=config, memory=memory, pool=pool)
+        return cls(
+            config=config,
+            memory=memory,
+            session_store=session_store,
+            budget=budget,
+            pool=pool,
+        )
 
     async def run(self, message: str, session_id: str) -> str:
         """Execute the full agent loop for a single user message."""
-        self.budget.check()
+        await self.budget.check()
 
         # Load existing session
-        events = self.session_store.load(session_id)
+        events = await self.session_store.load(session_id)
         if not events:
-            self.session_store.append(session_id, {"type": "session_start"})
+            await self.session_store.append(session_id, {"type": "session_start"})
 
         # Record user message
-        self.session_store.append(session_id, {"type": "user_message", "content": message})
+        await self.session_store.append(session_id, {"type": "user_message", "content": message})
+        self._user_message_count += 1
 
         # Build system prompt with matched skills
         matched_skills = self.skill_registry.match(message)
         system_prompt = await self.context_builder.build(message, matched_skills)
 
         # Reconstruct message history from events
-        all_events = self.session_store.load(session_id)
+        all_events = await self.session_store.load(session_id)
         messages = self.session_store.to_messages(all_events)
 
         # Run the LLM ↔ tool loop
@@ -121,22 +183,26 @@ class Agent:
         # Log to memory
         await self.memory.log(message, final_text)
 
+        # Maybe extract knowledge
+        await self._maybe_extract_knowledge(session_id, messages)
+
         return final_text
 
     async def run_stream(self, message: str, session_id: str) -> AsyncIterator[str]:
         """Execute the agent loop, yielding text deltas as they stream in."""
-        self.budget.check()
+        await self.budget.check()
 
-        events = self.session_store.load(session_id)
+        events = await self.session_store.load(session_id)
         if not events:
-            self.session_store.append(session_id, {"type": "session_start"})
+            await self.session_store.append(session_id, {"type": "session_start"})
 
-        self.session_store.append(session_id, {"type": "user_message", "content": message})
+        await self.session_store.append(session_id, {"type": "user_message", "content": message})
+        self._user_message_count += 1
 
         matched_skills = self.skill_registry.match(message)
         system_prompt = await self.context_builder.build(message, matched_skills)
 
-        all_events = self.session_store.load(session_id)
+        all_events = await self.session_store.load(session_id)
         messages = self.session_store.to_messages(all_events)
 
         final_text = ""
@@ -145,21 +211,46 @@ class Agent:
             yield chunk
 
         await self.memory.log(message, final_text)
+        await self._maybe_extract_knowledge(session_id, messages)
 
-    def _record_usage(self, usage) -> None:
+    async def _record_usage(self, usage, session_id: str = "") -> None:
         """Record token usage from an API response."""
-        self.budget.record(
+        await self.budget.record(
             model=self.config.llm.model,
             input_tokens=usage.input_tokens,
             output_tokens=usage.output_tokens,
+            session_id=session_id,
         )
+
+    async def _maybe_extract_knowledge(self, session_id: str, messages: list[dict]) -> None:
+        """Trigger knowledge extraction every 20 user messages."""
+        if self.compact_hook is None:
+            return
+        if self._user_message_count % 20 != 0:
+            return
+
+        try:
+            # Build conversation text from recent messages
+            text_parts = []
+            for msg in messages[-40:]:  # Last ~20 exchanges
+                role = msg.get("role", "")
+                content = msg.get("content", "")
+                if isinstance(content, str) and content:
+                    text_parts.append(f"{role}: {content}")
+            conversation_text = "\n".join(text_parts)
+            if conversation_text:
+                count = await self.compact_hook.run(session_id, conversation_text)
+                if count:
+                    logger.info("Extracted %d knowledge chunks from session %s", count, session_id)
+        except Exception:
+            logger.warning("Knowledge extraction failed", exc_info=True)
 
     async def _loop(self, system: str, messages: list[dict], session_id: str) -> str:
         """Core loop: call LLM, execute tools, repeat until text-only response."""
         tool_schemas = ToolRegistry.get_tool_schemas()
 
         while True:
-            self.budget.check()
+            await self.budget.check()
 
             response = await self.client.messages.create(
                 model=self.config.llm.model,
@@ -168,7 +259,7 @@ class Agent:
                 messages=messages,
                 tools=tool_schemas,
             )
-            self._record_usage(response.usage)
+            await self._record_usage(response.usage, session_id)
 
             # Collect text and tool_use blocks
             text_parts = []
@@ -183,7 +274,7 @@ class Agent:
 
             if not tool_uses:
                 # No tools — final response
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "assistant_message",
@@ -197,7 +288,7 @@ class Agent:
             if full_text:
                 assistant_content.append({"type": "text", "text": full_text})
             for tu in tool_uses:
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "tool_use",
@@ -224,7 +315,7 @@ class Agent:
                 content = (
                     result.output if result.success else f"Error: {result.error}\n{result.output}"
                 )
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "tool_result",
@@ -251,7 +342,7 @@ class Agent:
         tool_schemas = ToolRegistry.get_tool_schemas()
 
         while True:
-            self.budget.check()
+            await self.budget.check()
 
             # Stream the response
             text_parts = []
@@ -295,12 +386,12 @@ class Agent:
                             current_tool_input = {}
                 # Get final message for usage stats
                 final_message = await stream.get_final_message()
-                self._record_usage(final_message.usage)
+                await self._record_usage(final_message.usage, session_id)
 
             full_text = "".join(text_parts)
 
             if not tool_uses:
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "assistant_message",
@@ -315,7 +406,7 @@ class Agent:
                 assistant_content.append({"type": "text", "text": full_text})
 
             for tu in tool_uses:
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "tool_use",
@@ -344,7 +435,7 @@ class Agent:
 
                 yield f"\n\n**[Tool: {tu['name']}]** {'OK' if result.success else 'Error'}\n\n"
 
-                self.session_store.append(
+                await self.session_store.append(
                     session_id,
                     {
                         "type": "tool_result",

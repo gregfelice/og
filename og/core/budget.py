@@ -42,14 +42,16 @@ class BudgetTracker:
                     total += entry.get("cost", 0.0)
         return total
 
-    def check(self) -> None:
+    async def check(self) -> None:
         """Raise BudgetExceeded if we've hit the limit."""
         if self._total_cost >= self.budget_limit:
             raise BudgetExceeded(
                 f"Budget exhausted: ${self._total_cost:.4f} / ${self.budget_limit:.2f}"
             )
 
-    def record(self, model: str, input_tokens: int, output_tokens: int) -> float:
+    async def record(
+        self, model: str, input_tokens: int, output_tokens: int, session_id: str = ""
+    ) -> float:
         """Record token usage and return the cost of this call."""
         pricing = PRICING.get(model, DEFAULT_PRICING)
         cost = (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
@@ -76,4 +78,6 @@ class BudgetTracker:
         return max(0.0, self.budget_limit - self._total_cost)
 
     def summary(self) -> str:
-        return f"${self._total_cost:.4f} / ${self.budget_limit:.2f} (${self.remaining:.4f} remaining)"
+        return (
+            f"${self._total_cost:.4f} / ${self.budget_limit:.2f} (${self.remaining:.4f} remaining)"
+        )

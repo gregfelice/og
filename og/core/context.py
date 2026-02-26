@@ -1,17 +1,26 @@
-"""Layered system prompt builder: AGENTS.md + SOUL.md + TOOLS.md + skills + memory."""
+"""Layered system prompt builder: AGENTS.md + SOUL.md + TOOLS.md + skills + memory + contradictions."""
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from og.memory.manager import Memory
+from og.memory.pg import PgMemory
 from og.skills.loader import Skill, SkillRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class ContextBuilder:
     """Composes layered system prompts from markdown sources."""
 
-    def __init__(self, prompts_dir: Path, memory: Memory, skill_registry: SkillRegistry):
+    def __init__(
+        self,
+        prompts_dir: Path,
+        memory: Memory | PgMemory,
+        skill_registry: SkillRegistry,
+    ):
         self.prompts_dir = Path(prompts_dir)
         self.memory = memory
         self.skill_registry = skill_registry
@@ -22,7 +31,12 @@ class ContextBuilder:
             return path.read_text(encoding="utf-8")
         return ""
 
-    async def build(self, message: str, matched_skills: list[Skill]) -> str:
+    async def build(
+        self,
+        message: str,
+        matched_skills: list[Skill],
+        entities: list[str] | None = None,
+    ) -> str:
         sections = []
 
         # Layer 1: Agent identity
@@ -64,5 +78,20 @@ class ContextBuilder:
             sections.append(
                 f"# Memory\n\nPersisted facts from previous sessions:\n\n{memory_content}"
             )
+
+        # Layer 7: Contradiction warnings (when graph is available)
+        if entities and isinstance(self.memory, PgMemory) and self.memory.graph is not None:
+            try:
+                contradictions = await self.memory.graph.find_contradictions(entities)
+                if contradictions:
+                    warnings = "# Contradiction Warnings\n\n"
+                    warnings += (
+                        "The following stored knowledge items may contradict each other:\n\n"
+                    )
+                    for c in contradictions:
+                        warnings += f"- **A:** {c['statement_a']}\n  **B:** {c['statement_b']}\n\n"
+                    sections.append(warnings)
+            except Exception:
+                logger.debug("Contradiction check failed", exc_info=True)
 
         return "\n\n---\n\n".join(sections)
