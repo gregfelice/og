@@ -88,7 +88,7 @@ class PgMemory:
     ) -> list[str]:
         """Hybrid search with optional graph-boosted triple-modality RRF."""
         try:
-            embedding = await self.embedder.embed(query)
+            embedding = str(await self.embedder.embed(query))
 
             # Try triple-modality if graph is available and entities are provided
             if self.graph is not None and entities:
@@ -118,7 +118,7 @@ class PgMemory:
         """Embed and store a conversation exchange."""
         try:
             text = f"User: {user_msg[:200]}\nAssistant: {assistant_msg[:500]}"
-            embedding = await self.embedder.embed(text)
+            embedding = str(await self.embedder.embed(text))
             await self.pool.execute(
                 INSERT_CHUNK_SQL,
                 self.project_id,
@@ -133,7 +133,7 @@ class PgMemory:
     async def save_fact(self, fact: str) -> None:
         """Embed and store a fact."""
         try:
-            embedding = await self.embedder.embed(fact)
+            embedding = str(await self.embedder.embed(fact))
             await self.pool.execute(
                 INSERT_CHUNK_SQL,
                 self.project_id,

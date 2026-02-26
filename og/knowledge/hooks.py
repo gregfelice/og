@@ -65,7 +65,10 @@ class PreCompactHook:
 
         try:
             async with self.pool.acquire() as conn:
-                await conn.execute("LOAD 'age';")
+                try:
+                    await conn.execute("LOAD 'age';")
+                except Exception:
+                    pass  # Already loaded via shared_preload_libraries
                 await conn.execute("SET search_path = ag_catalog, public;")
 
                 async with conn.transaction():
@@ -91,7 +94,7 @@ class PreCompactHook:
                             self.project_id,
                             chunk.chunk_type,
                             chunk.text,
-                            embeddings[i],
+                            str(embeddings[i]),
                             session_id,
                         )
                         chunk_id = row["id"] if row else None

@@ -43,7 +43,7 @@ def _parse_agtype_float(val: Any) -> float:
 
 def _cypher_query(cypher: str, result_columns: str) -> str:
     """Build the SQL wrapper for a Cypher query."""
-    return f"{AGE_SEARCH_PATH} SELECT * FROM cypher('{GRAPH_NAME}', $$ {cypher} $$) AS ({result_columns});"
+    return f"SELECT * FROM cypher('{GRAPH_NAME}', $$ {cypher} $$) AS ({result_columns});"
 
 
 class KnowledgeGraph:
@@ -58,7 +58,10 @@ class KnowledgeGraph:
         sql = _cypher_query(cypher, result_columns)
         try:
             async with self.pool.acquire() as conn:
-                await conn.execute("LOAD 'age';")
+                try:
+                    await conn.execute("LOAD 'age';")
+                except Exception:
+                    pass  # Already loaded via shared_preload_libraries
                 await conn.execute(AGE_SEARCH_PATH)
                 return await conn.fetch(sql)
         except Exception:
