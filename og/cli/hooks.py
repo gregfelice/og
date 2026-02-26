@@ -17,6 +17,12 @@ WHERE project_id = $1 AND chunk_type IN ('decision', 'constraint', 'pattern', 'c
 ORDER BY created_at DESC LIMIT $2;
 """
 
+INJECT_ALL_SQL = """
+SELECT chunk_type, text FROM context_chunks
+WHERE chunk_type IN ('decision', 'constraint', 'pattern', 'correction')
+ORDER BY created_at DESC LIMIT $1;
+"""
+
 
 async def create_pool(config: Config):
     """Create a lightweight asyncpg connection pool for hook subcommands."""
@@ -128,13 +134,16 @@ async def inject_impl(
     """Fetch high-value context chunks and format for injection into Claude context."""
     load_dotenv()
     config = Config()
-    proj = project_id or config.memory.project_id
+    proj = project_id
 
     # Try PG-backed injection
     try:
         pool = await create_pool(config)
         try:
-            rows = await pool.fetch(INJECT_SQL, proj, limit)
+            if proj:
+                rows = await pool.fetch(INJECT_SQL, proj, limit)
+            else:
+                rows = await pool.fetch(INJECT_ALL_SQL, limit)
             if rows:
                 return _format_inject_rows(rows)
         finally:
