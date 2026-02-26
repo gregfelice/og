@@ -67,12 +67,33 @@ async def _run(config: Config, message: str | None, session_id: str) -> None:
             await agent.pool.close()
 
 
-@click.command()
+class DefaultGroup(click.Group):
+    """Falls through to 'chat' when no subcommand matches."""
+
+    def parse_args(self, ctx, args):
+        # Let --help and --version through to the group itself
+        if not args:
+            args = ["chat"]
+        elif args[0] not in self.commands and not args[0].startswith("-"):
+            # Bare message arg — route to chat
+            args = ["chat"] + args
+        elif args[0] not in self.commands and args[0] in ("-s", "--session", "-m", "--model"):
+            # Chat options without explicit subcommand
+            args = ["chat"] + args
+        return super().parse_args(ctx, args)
+
+
+@click.group(cls=DefaultGroup)
+def main():
+    """OG — OpenClaw Python PoC agent."""
+
+
+@main.command()
 @click.argument("message", required=False)
 @click.option("--session", "-s", default=None, help="Session name (default: auto)")
 @click.option("--model", "-m", default=None, help="Model override")
-def main(message: str | None, session: str | None, model: str | None) -> None:
-    """OG — OpenClaw Python PoC agent."""
+def chat(message: str | None, session: str | None, model: str | None) -> None:
+    """Start interactive chat or send a one-shot message."""
     load_dotenv()
     config = Config()
 
@@ -81,6 +102,47 @@ def main(message: str | None, session: str | None, model: str | None) -> None:
 
     session_id = session or config.session.default_session
     asyncio.run(_run(config, message, session_id))
+
+
+@main.command()
+@click.argument("query")
+@click.option("--project", "-p", default=None, help="Project ID override")
+@click.option("--entity", "-e", multiple=True, help="Entities for graph-boosted search")
+@click.option("--limit", "-n", default=10, help="Max results")
+def recall(query: str, project: str | None, entity: tuple[str, ...], limit: int) -> None:
+    """Search stored knowledge for relevant context."""
+    from og.cli.hooks import recall_impl
+
+    entities = list(entity) if entity else None
+    result = asyncio.run(
+        recall_impl(query, project_id=project or "", entities=entities, limit=limit)
+    )
+    if result:
+        click.echo(result)
+
+
+@main.command()
+@click.option("--file", "transcript_file", required=True, help="Path to JSONL transcript")
+@click.option("--session-id", default=None, help="Session ID for the transcript")
+@click.option("--project", "-p", default=None, help="Project ID override")
+def extract(transcript_file: str, session_id: str | None, project: str | None) -> None:
+    """Extract knowledge from a Claude Code transcript."""
+    from og.cli.hooks import extract_impl
+
+    result = asyncio.run(extract_impl(transcript_file, session_id=session_id, project_id=project))
+    click.echo(result)
+
+
+@main.command()
+@click.option("--project", "-p", default=None, help="Project ID override")
+@click.option("--limit", "-n", default=20, help="Max chunks to inject")
+def inject(project: str | None, limit: int) -> None:
+    """Inject stored context (decisions, constraints, patterns, corrections)."""
+    from og.cli.hooks import inject_impl
+
+    result = asyncio.run(inject_impl(project_id=project, limit=limit))
+    if result:
+        click.echo(result)
 
 
 if __name__ == "__main__":
