@@ -53,6 +53,20 @@ async def one_shot(agent: Agent, message: str, session_id: str) -> None:
         console.print(f"[bold red]Budget limit reached:[/bold red] {e}")
 
 
+async def _run(config: Config, message: str | None, session_id: str) -> None:
+    """Async entry: create agent then dispatch to one-shot or interactive."""
+    agent = await Agent.create(config)
+    try:
+        if message:
+            await one_shot(agent, message, session_id)
+        else:
+            channel = CLIChannel()
+            await interactive_loop(agent, channel, session_id)
+    finally:
+        if agent.pool is not None:
+            await agent.pool.close()
+
+
 @click.command()
 @click.argument("message", required=False)
 @click.option("--session", "-s", default=None, help="Session name (default: auto)")
@@ -66,13 +80,7 @@ def main(message: str | None, session: str | None, model: str | None) -> None:
         config.llm.model = model
 
     session_id = session or config.session.default_session
-    agent = Agent(config)
-
-    if message:
-        asyncio.run(one_shot(agent, message, session_id))
-    else:
-        channel = CLIChannel()
-        asyncio.run(interactive_loop(agent, channel, session_id))
+    asyncio.run(_run(config, message, session_id))
 
 
 if __name__ == "__main__":

@@ -16,7 +16,7 @@ class Memory:
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.daily_dir.mkdir(parents=True, exist_ok=True)
 
-    def search(self, query: str, limit: int = 5) -> list[str]:
+    async def search(self, query: str, limit: int = 5) -> list[str]:
         """Keyword search across MEMORY.md and recent daily logs."""
         results = []
         query_lower = query.lower()
@@ -37,7 +37,7 @@ class Memory:
 
         return results[:limit]
 
-    def log(self, user_msg: str, assistant_msg: str) -> None:
+    async def log(self, user_msg: str, assistant_msg: str) -> None:
         """Append a conversation exchange to today's daily log."""
         today = datetime.now().strftime("%Y-%m-%d")
         log_path = self.daily_dir / f"{today}.md"
@@ -46,12 +46,12 @@ class Memory:
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(entry)
 
-    def save_fact(self, fact: str) -> None:
+    async def save_fact(self, fact: str) -> None:
         """Append a fact to MEMORY.md."""
         with open(self.memory_path, "a", encoding="utf-8") as f:
             f.write(f"- {fact}\n")
 
-    def load_memory(self) -> str:
+    async def load_memory(self, message: str = "", limit: int = 5) -> str:
         """Load the full MEMORY.md contents."""
         if self.memory_path.exists():
             return self.memory_path.read_text(encoding="utf-8")

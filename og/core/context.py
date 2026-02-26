@@ -22,7 +22,7 @@ class ContextBuilder:
             return path.read_text(encoding="utf-8")
         return ""
 
-    def build(self, message: str, matched_skills: list[Skill]) -> str:
+    async def build(self, message: str, matched_skills: list[Skill]) -> str:
         sections = []
 
         # Layer 1: Agent identity
@@ -51,14 +51,18 @@ class ContextBuilder:
 
         # Layer 5: Matched skill instructions (only when triggered)
         if matched_skills:
-            skills_section = "# Active Skills\n\nThe following skills are relevant to this request:\n"
+            skills_section = (
+                "# Active Skills\n\nThe following skills are relevant to this request:\n"
+            )
             for skill in matched_skills:
                 skills_section += f"\n---\n\n{skill.instructions}\n"
             sections.append(skills_section)
 
-        # Layer 5: Memory context
-        memory_content = self.memory.load_memory()
+        # Layer 6: Memory context
+        memory_content = await self.memory.load_memory(message)
         if memory_content:
-            sections.append(f"# Memory\n\nPersisted facts from previous sessions:\n\n{memory_content}")
+            sections.append(
+                f"# Memory\n\nPersisted facts from previous sessions:\n\n{memory_content}"
+            )
 
         return "\n\n---\n\n".join(sections)

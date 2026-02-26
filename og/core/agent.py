@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -12,24 +13,30 @@ from og.config.schema import Config
 from og.core.budget import BudgetTracker
 from og.core.context import ContextBuilder
 from og.core.tools import ToolRegistry, ToolResult
+from og.memory.embeddings import EmbeddingClient
 from og.memory.manager import Memory
+from og.memory.pg import PgMemory
 from og.session.store import SessionStore
 from og.skills.loader import SkillRegistry
+
+logger = logging.getLogger(__name__)
 
 
 class Agent:
     """Main agent runtime — orchestrates the LLM ↔ tool loop."""
 
-    def __init__(self, config: Config):
+    def __init__(
+        self,
+        config: Config,
+        memory: Memory | PgMemory,
+        pool=None,
+    ):
         self.config = config
         self.client = anthropic.AsyncAnthropic()
         self.tools = ToolRegistry(bash_timeout=config.tools.bash_timeout)
         self.session_store = SessionStore(config.session.storage_dir)
-        self.memory = Memory(
-            storage_dir=config.memory.storage_dir,
-            memory_file=config.memory.memory_file,
-            daily_dir=config.memory.daily_logs_dir,
-        )
+        self.memory = memory
+        self.pool = pool
         self.budget = BudgetTracker(
             budget_limit=config.llm.budget_limit,
             ledger_path=Path.home() / ".og" / "budget.jsonl",
@@ -39,15 +46,54 @@ class Agent:
         skill_dirs = [Path("skills")]
         if config.skills.dirs:
             skill_dirs.extend(config.skills.dirs)
-        self.skill_registry = SkillRegistry(
-            skill_dirs if config.skills.enabled else None
-        )
+        self.skill_registry = SkillRegistry(skill_dirs if config.skills.enabled else None)
 
         self.context_builder = ContextBuilder(
             prompts_dir=config.prompts_dir,
             memory=self.memory,
             skill_registry=self.skill_registry,
         )
+
+    @classmethod
+    async def create(cls, config: Config) -> Agent:
+        """Async factory: tries PostgreSQL + pgvector, falls back to flat-file Memory."""
+        pool = None
+        memory: Memory | PgMemory
+
+        try:
+            import asyncpg
+            from pgvector.asyncpg import register_vector
+
+            pool = await asyncpg.create_pool(
+                dsn=config.db.dsn,
+                min_size=config.db.min_pool,
+                max_size=config.db.max_pool,
+                init=lambda conn: register_vector(conn),
+            )
+            embedder = EmbeddingClient(
+                base_url=config.embedding.ollama_base_url,
+                model=config.embedding.model,
+            )
+            # Quick connectivity check: embed a test string
+            await embedder.embed("connection test")
+            memory = PgMemory(
+                pool=pool,
+                embedder=embedder,
+                project_id=config.memory.project_id,
+            )
+            logger.info("Using PostgreSQL + pgvector memory store")
+        except Exception as e:
+            logger.warning("DB unavailable, using flat-file memory: %s", e)
+            if pool is not None:
+                await pool.close()
+                pool = None
+            memory = Memory(
+                storage_dir=config.memory.storage_dir,
+                memory_file=config.memory.memory_file,
+                daily_dir=config.memory.daily_logs_dir,
+            )
+
+        return cls(config=config, memory=memory, pool=pool)
 
     async def run(self, message: str, session_id: str) -> str:
         """Execute the full agent loop for a single user message."""
@@ -63,7 +109,7 @@ class Agent:
 
         # Build system prompt with matched skills
         matched_skills = self.skill_registry.match(message)
-        system_prompt = self.context_builder.build(message, matched_skills)
+        system_prompt = await self.context_builder.build(message, matched_skills)
 
         # Reconstruct message history from events
         all_events = self.session_store.load(session_id)
@@ -73,13 +119,11 @@ class Agent:
         final_text = await self._loop(system_prompt, messages, session_id)
 
         # Log to memory
-        self.memory.log(message, final_text)
+        await self.memory.log(message, final_text)
 
         return final_text
 
-    async def run_stream(
-        self, message: str, session_id: str
-    ) -> AsyncIterator[str]:
+    async def run_stream(self, message: str, session_id: str) -> AsyncIterator[str]:
         """Execute the agent loop, yielding text deltas as they stream in."""
         self.budget.check()
 
@@ -90,7 +134,7 @@ class Agent:
         self.session_store.append(session_id, {"type": "user_message", "content": message})
 
         matched_skills = self.skill_registry.match(message)
-        system_prompt = self.context_builder.build(message, matched_skills)
+        system_prompt = await self.context_builder.build(message, matched_skills)
 
         all_events = self.session_store.load(session_id)
         messages = self.session_store.to_messages(all_events)
@@ -100,7 +144,7 @@ class Agent:
             final_text += chunk
             yield chunk
 
-        self.memory.log(message, final_text)
+        await self.memory.log(message, final_text)
 
     def _record_usage(self, usage) -> None:
         """Record token usage from an API response."""
@@ -139,10 +183,13 @@ class Agent:
 
             if not tool_uses:
                 # No tools — final response
-                self.session_store.append(session_id, {
-                    "type": "assistant_message",
-                    "content": full_text,
-                })
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "assistant_message",
+                        "content": full_text,
+                    },
+                )
                 return full_text
 
             # Persist assistant message with tool_use blocks
@@ -150,18 +197,23 @@ class Agent:
             if full_text:
                 assistant_content.append({"type": "text", "text": full_text})
             for tu in tool_uses:
-                self.session_store.append(session_id, {
-                    "type": "tool_use",
-                    "tool_use_id": tu.id,
-                    "name": tu.name,
-                    "input": tu.input,
-                })
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tu.id,
-                    "name": tu.name,
-                    "input": tu.input,
-                })
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "tool_use",
+                        "tool_use_id": tu.id,
+                        "name": tu.name,
+                        "input": tu.input,
+                    },
+                )
+                assistant_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tu.id,
+                        "name": tu.name,
+                        "input": tu.input,
+                    }
+                )
 
             messages.append({"role": "assistant", "content": assistant_content})
 
@@ -169,19 +221,26 @@ class Agent:
             tool_results_content = []
             for tu in tool_uses:
                 result: ToolResult = await self.tools.execute(tu.name, tu.input)
-                content = result.output if result.success else f"Error: {result.error}\n{result.output}"
-                self.session_store.append(session_id, {
-                    "type": "tool_result",
-                    "tool_use_id": tu.id,
-                    "content": content,
-                    "is_error": not result.success,
-                })
-                tool_results_content.append({
-                    "type": "tool_result",
-                    "tool_use_id": tu.id,
-                    "content": content,
-                    "is_error": not result.success,
-                })
+                content = (
+                    result.output if result.success else f"Error: {result.error}\n{result.output}"
+                )
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": content,
+                        "is_error": not result.success,
+                    },
+                )
+                tool_results_content.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu.id,
+                        "content": content,
+                        "is_error": not result.success,
+                    }
+                )
 
             messages.append({"role": "user", "content": tool_results_content})
 
@@ -226,11 +285,13 @@ class Agent:
                                 parsed_input = json.loads(current_tool_input["input_json"])
                             except json.JSONDecodeError:
                                 parsed_input = {}
-                            tool_uses.append({
-                                "id": current_tool_input["id"],
-                                "name": current_tool_input["name"],
-                                "input": parsed_input,
-                            })
+                            tool_uses.append(
+                                {
+                                    "id": current_tool_input["id"],
+                                    "name": current_tool_input["name"],
+                                    "input": parsed_input,
+                                }
+                            )
                             current_tool_input = {}
                 # Get final message for usage stats
                 final_message = await stream.get_final_message()
@@ -239,10 +300,13 @@ class Agent:
             full_text = "".join(text_parts)
 
             if not tool_uses:
-                self.session_store.append(session_id, {
-                    "type": "assistant_message",
-                    "content": full_text,
-                })
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "assistant_message",
+                        "content": full_text,
+                    },
+                )
                 return
 
             # Persist and execute tools (same as non-streaming)
@@ -251,39 +315,51 @@ class Agent:
                 assistant_content.append({"type": "text", "text": full_text})
 
             for tu in tool_uses:
-                self.session_store.append(session_id, {
-                    "type": "tool_use",
-                    "tool_use_id": tu["id"],
-                    "name": tu["name"],
-                    "input": tu["input"],
-                })
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": tu["id"],
-                    "name": tu["name"],
-                    "input": tu["input"],
-                })
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "tool_use",
+                        "tool_use_id": tu["id"],
+                        "name": tu["name"],
+                        "input": tu["input"],
+                    },
+                )
+                assistant_content.append(
+                    {
+                        "type": "tool_use",
+                        "id": tu["id"],
+                        "name": tu["name"],
+                        "input": tu["input"],
+                    }
+                )
 
             messages.append({"role": "assistant", "content": assistant_content})
 
             tool_results_content = []
             for tu in tool_uses:
                 result = await self.tools.execute(tu["name"], tu["input"])
-                content = result.output if result.success else f"Error: {result.error}\n{result.output}"
+                content = (
+                    result.output if result.success else f"Error: {result.error}\n{result.output}"
+                )
 
                 yield f"\n\n**[Tool: {tu['name']}]** {'OK' if result.success else 'Error'}\n\n"
 
-                self.session_store.append(session_id, {
-                    "type": "tool_result",
-                    "tool_use_id": tu["id"],
-                    "content": content,
-                    "is_error": not result.success,
-                })
-                tool_results_content.append({
-                    "type": "tool_result",
-                    "tool_use_id": tu["id"],
-                    "content": content,
-                    "is_error": not result.success,
-                })
+                self.session_store.append(
+                    session_id,
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": content,
+                        "is_error": not result.success,
+                    },
+                )
+                tool_results_content.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tu["id"],
+                        "content": content,
+                        "is_error": not result.success,
+                    }
+                )
 
             messages.append({"role": "user", "content": tool_results_content})
